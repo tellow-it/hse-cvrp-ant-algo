@@ -1,0 +1,22 @@
+[MASTER]
+disable=
+    C0114,
+    C0115,
+    C0116,
+    C0411,
+    W0640,
+    W0718,
+    W0719,
+    W0106,
+    W1203,
+    E1101,
+    R0903,
+    R0914,
+    R0912,
+    R0915
+
+
+ignore=.venv
+
+[FORMAT]
+max-line-length=88
