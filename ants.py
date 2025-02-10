@@ -1,241 +1,169 @@
-import sys
+import random
 
 import numpy as np
-import vrplib
-from dataclasses import dataclass
-from random import Random
-import numpy
-import os
 
+from test_data_parser import CVRPTestParser
 
-MAX_RANGE = 1000
+SEED = 42
+NUM_ANTS = 50
 NUMBER_OF_ITERATIONS = 300
 ALPHA = 1
 BETA = 7
 EVAPORATE_FACTOR = 0.1
-PHEROMONES_FACTOR = 20
-
-MAX_SIZE = sys.maxsize
+Q = 10
 
 
-@dataclass
-class TestData:
-    truck_count: int
-    capacity: int
-    demand: list
-    distances: list[list]
-    optimal: int
-
-
-class CVRPTestParser:
-    @classmethod
-    def parse(cls, bench_dir: str, filename: str) -> TestData:
-        instance = vrplib.read_instance(os.path.join(bench_dir, filename))
-
-        truck_count = int(instance["name"].split("-")[-1][1:])
-        capacity = int(instance["capacity"])
-        distances = instance["edge_weight"]
-        demand = instance["demand"]
-
-        sol_file = filename.replace(".vrp", ".sol")
-        solution = vrplib.read_solution(os.path.join(bench_dir, sol_file))
-        optimal = solution["cost"]
-
-        test_data = TestData(int(truck_count), int(capacity), demand, distances, int(optimal))
-        return test_data
-
-
-class _AntSolution:
-    def __init__(self) -> None:
-        self.current_route = [0]
-        self.current_route_length = -1
-        self.best_route = []
-        self.best_route_length = MAX_SIZE
-
-    def check_current_route(self) -> bool:
-        if self.current_route_length == -1 or self.current_route_length >= self.best_route_length:
-            return False
-
-        self.best_route = self.current_route
-        self.best_route_length = self.current_route_length
-        return True
-
-    def reset(self) -> None:
-        self.current_route = [0]
-        self.current_route_length = -1
-
-
-class ACOSolver:
-    def __init__(self,
-                 number_of_trucks: int,
-                 max_capacity: int,
-                 demand: list,
-                 distances: list[list],
-                 optimal: int,
-                 max_range: int,
-                 number_of_ants: int,
-                 alpha: float,
-                 beta: float,
-                 pheromones_factor: float,
-                 evaporate_factor: float,
-                 number_of_iterations: int,
-                 seed: int = None,
-                 ) -> None:
-        self.distances = distances
-        self.demand = demand
-        self.max_capacity = max_capacity
-        self.max_range = max_range
+class AcoSolver:
+    def __init__(
+            self,
+            number_of_trucks,
+            max_capacity,
+            demand,
+            distances,
+            depot,
+            optimal
+    ):
         self.number_of_trucks = number_of_trucks
-        self.was_visited = [-self.number_of_trucks + 1] + [0] * (len(self.demand) - 1)
-        self.rem_capacity = self.max_capacity
-        self.rem_range = self.max_range
-        self.current_id = 0
-        self.waiting = self.demand[1:]
-        self.route = []
-        self.route_length = MAX_SIZE
-        self.result = None
-        self.seed = seed
-        self.random = Random(self.seed)
+        self.max_capacity = max_capacity
+        self.demand = demand
+        self.distances = distances
+        self.depot = depot
         self.optimal = optimal
-        self.number_of_ants = number_of_ants
-        self.alpha = alpha
-        self.beta = beta
-        self.pheromones_factor = pheromones_factor
-        self.evaporate_factor = evaporate_factor
-        self.number_of_iterations = number_of_iterations
-        self.pheromones = self._init_pheromones_by_distance_matrix()
-        self.current_ant_id = 0
-        self.ants = [_AntSolution() for _ in range(number_of_ants)]
-        self.optimal = optimal
-        self.diff = None
+
+        self.num_nodes = len(self.demand)
+
+        self.num_ants = self.num_nodes if self.num_nodes > NUM_ANTS else NUM_ANTS
+        self.num_iterations = NUMBER_OF_ITERATIONS
+        self.alpha = ALPHA
+        self.beta = BETA
+        self.evaporate = EVAPORATE_FACTOR
+        self.Q = Q
+        self.seed = SEED
+
+        self.pheromones = self._init_pheromones_by_distance()
+        self.best_solution = None
+        self.best_cost = float('inf')
 
     def _init_pheromones(self):
-        return numpy.ones((len(self.demand), len(self.demand)))
+        return np.ones((self.num_nodes, self.num_nodes))
 
-    def _init_pheromones_by_distance_matrix(self):
+    def _init_pheromones_by_distance(self):
         avg_distance = np.mean(self.distances)
-        return (avg_distance / (self.distances + 1e-6)) * 10
+        return avg_distance / (self.distances + 1e-6)
 
-    def _can_visit(self, target_id: int) -> bool:
-        range_fulfilled = (
-                (target_id == 0 and self._get_distance_to(target_id) <= self.rem_range) or
-                self._get_distance_to(target_id) + self.distances[target_id][0] <= self.rem_range
-        )
-        return (self.current_id != target_id
-                and self.was_visited[target_id] < 1
-                and self.demand[target_id] <= self.rem_capacity
-                and range_fulfilled)
+    def _calculate_probability(self, current_node, unvisited):
+        probabilities = []
+        for node in unvisited:
+            probabilities.append(
+                self.pheromones[current_node][node] ** self.alpha *
+                (1 / (self.distances[current_node][node] + 1e-6)) ** self.beta
+            )
 
-    def _visit(self, target_id: int, route: list[int]) -> float:
-        self.was_visited[target_id] += 1
-        self.rem_capacity -= self.demand[target_id]
-        self.rem_range -= self._get_distance_to(target_id)
-        distance = self._get_distance_to(target_id)
-        self.current_id = target_id
-        route.append(self.current_id)
-        if target_id == 0:
-            self.rem_capacity = self.max_capacity
-            self.rem_range = self.max_range
-        return distance
+        probabilities = np.array(probabilities)
+        total = probabilities.sum()
+        if total == 0 or np.isnan(total):
+            return np.ones(len(unvisited)) / len(unvisited)
 
-    def _check_all_visited(self) -> bool:
-        return all(self.was_visited[1:])
+        probabilities /= total
+        return probabilities
 
-    def _get_distance_to(self, target_id: int) -> float:
-        return self.distances[self.current_id][target_id]
+    def _construct_ant_solution(self):
+        num_nodes = len(self.demand)
+        unvisited = set(range(num_nodes)) - {self.depot}
+        routes = []
 
-    def _find_route(self) -> tuple[list[int], float]:
-        route_length = 0
-        route = [0]
-        while not self._check_all_visited():
-            to_visit = list(filter(self._can_visit, range(0, len(self.demand))))
-            if len(to_visit) == 0:
-                return [], -1
-            if 0 in to_visit and len(to_visit) > 1:
-                to_visit.remove(0)
-            target_id = self._get_target_id(to_visit)
-            route_length += self._visit(target_id, route)
-        route_length = (route_length + self._visit(0, route) if self._can_visit(0) else -1)
-        return route, route_length
+        while unvisited:
+            route = [self.depot]
+            load = 0
+            current_node = self.depot
 
-    def _update_result(self, route: list[int], route_length: float) -> None:
-        if route_length < self.route_length:
-            self.route = route
-            self.route_length = route_length
-            self.result = True
+            while unvisited:
+                probabilities = self._calculate_probability(
+                    current_node=current_node,
+                    unvisited=list(unvisited)
+                )
+                if len(probabilities) == 0:
+                    break
 
-    def _get_route_length(self, route: list[int]) -> float:
-        length = 0
-        for i, city_from in enumerate(route[:-1]):
-            city_to = route[i + 1]
-            length += self.distances[city_from][city_to]
-        return length
+                next_node = random.choices(list(unvisited), probabilities, k=1)[0]
 
-    def _get_target_id(self, allowed_cities: list[int]) -> int:
-        weights = []
-        for city in allowed_cities:
-            if self._get_distance_to(city) == 0:
-                return city
+                if load + self.demand[next_node] > self.max_capacity:
+                    break
 
-            pheromon_factor = self.pheromones[self.current_id, city]
-            heuristic_factor = 1 / self._get_distance_to(city)
-            weights.append((pheromon_factor ** self.alpha) * (heuristic_factor ** self.beta))
-        if sum(weights) <= 0.0:
-            weights = None
-        return self.random.choices(allowed_cities, weights, k=1)[0]
+                route.append(next_node)
+                load += self.demand[next_node]
+                unvisited.remove(next_node)
+                current_node = next_node
 
-    def _lay_pheromones(self, route: list[int], factor: float = None) -> None:
-        if factor is None:
-            factor = self.pheromones_factor
-        if len(route) <= 0:
-            return
-        for i in range(len(route) - 1):
-            city_from = route[i]
-            city_to = route[i + 1]
-            if city_from != city_to:
-                self.pheromones[city_from, city_to] += factor / self._get_route_length(route)
+            route.append(self.depot)
+            routes.append(route)
 
-    def _update_pheromones(self) -> None:
-        for i in range(len(self.demand)):
-            for j in range(len(self.demand)):
-                if i != j:
-                    self.pheromones[i, j] *= (1 - self.evaporate_factor)
+        return routes
 
-    def solve(self) -> None:
-        for i in range(self.number_of_iterations):
-            for ant in self.ants:
-                ant.reset()
-                self.was_visited = [-self.number_of_trucks + 1] + [0] * (len(self.demand) - 1)
-                ant.current_route, ant.current_route_length = self._find_route()
-                self._lay_pheromones(ant.current_route)
-                if ant.check_current_route():
-                    self._update_result(ant.best_route, ant.best_route_length)
-            self._update_pheromones()
+    def _calculate_cost(self, solution):
+        total_cost = 0
+        for routes in solution:
+            for route in routes:
+                cost = 0
+                for i in range(len(route) - 1):
+                    cost += self.distances[route[i]][route[i + 1]]
+                total_cost += cost
+        return total_cost
+
+    def _update_pheromones(self, solutions, costs):
+        self.pheromones *= (1 - self.evaporate)
+
+        for routes, cost in zip(solutions, costs):
+            for route in routes:
+                for i in range(len(route) - 1):
+                    from_node = route[i]
+                    to_node = route[i + 1]
+                    self.pheromones[from_node][to_node] += self.Q / (cost + 1e-6)
+                    self.pheromones[to_node][from_node] \
+                        = self.pheromones[from_node][to_node]
+
+    def solve(self):
+        for _ in range(self.num_iterations):
+            solutions = []
+
+            for _ in range(self.num_ants):
+                solution = self._construct_ant_solution()
+                solutions.append(solution)
+
+            costs = [self._calculate_cost([solution]) for solution in solutions]
+
+            # top_k = max(1, len(solutions) // 2)
+            top_k = 10
+            best_solutions_i = np.argsort(costs)[:top_k]
+            new_cost = []
+            new_sol = []
+            for i in best_solutions_i:
+                new_cost.append(costs[i])
+                new_sol.append(solutions[i])
+
+            self._update_pheromones(new_sol, new_cost)
+
+            min_cost = min(costs)
+            if min_cost < self.best_cost:
+                self.best_cost = min_cost
+                self.best_solution = solutions[costs.index(min_cost)]
+
+        return self.best_solution, self.best_cost
 
     def get_result(self):
-        self.diff = round(abs(self.route_length - self.optimal) / self.optimal, 2)
-        return self.route_length, self.optimal, self.diff
+        diff = round((self.best_cost - self.optimal) / self.optimal, 2)
+        return self.best_cost, self.optimal, diff
 
 
-
-
-
-def run_test(bench_dir, test):
+def run_new_test(bench_dir, test):
     test_set = CVRPTestParser.parse(bench_dir, test)
-    solver = ACOSolver(
+    solver = AcoSolver(
         number_of_trucks=test_set.truck_count,
         max_capacity=test_set.capacity,
         demand=test_set.demand,
         distances=test_set.distances,
-        optimal=test_set.optimal,
-        max_range=MAX_RANGE,
-        number_of_ants=len(test_set.demand),
-        alpha=ALPHA,
-        beta=BETA,
-        pheromones_factor=PHEROMONES_FACTOR,
-        evaporate_factor=EVAPORATE_FACTOR,
-        number_of_iterations=NUMBER_OF_ITERATIONS,
-        seed=None,
+        depot=test_set.depot,
+        optimal=test_set.optimal
     )
     solver.solve()
     route_path, optimal, diff = solver.get_result()
